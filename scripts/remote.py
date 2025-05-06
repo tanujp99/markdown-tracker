@@ -13,12 +13,12 @@ from dotenv import load_dotenv
 
 # --- Configuration ---
 load_dotenv()  # Load environment variables from .env file
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+REMOTE_LLM_API_KEY = os.getenv("REMOTE_LLM_API_KEY")
 SAVE_PATH = os.getenv("MARKDOWN_SAVE_PATH")
 
 # --- Input Validation ---
-if not GEMINI_API_KEY:
-    print("Error: GEMINI_API_KEY not found. Please set it in the .env file.")
+if not REMOTE_LLM_API_KEY:
+    print("Error: REMOTE_LLM_API_KEY not found. Please set it in the .env file.")
     exit()
 if not SAVE_PATH:
     print("Error: MARKDOWN_SAVE_PATH not found in .env file or environment.")
@@ -27,7 +27,7 @@ if not SAVE_PATH:
 
 # --- Remote LLM Configuration ---
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=REMOTE_LLM_API_KEY)
 except Exception as e:
     print(f"Error configuring Remote LLM API: {e}")
     exit()
