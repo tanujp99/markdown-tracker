@@ -10,24 +10,32 @@ from selenium.common.exceptions import WebDriverException
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 from dotenv import load_dotenv
-from markdownify import markdownify # Import markdownify
 
 # --- Configuration ---
-load_dotenv()
+load_dotenv()  # Load environment variables from .env file
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SAVE_PATH = os.getenv("MARKDOWN_SAVE_PATH")
+
+# --- Input Validation ---
 if not GEMINI_API_KEY:
     print("Error: GEMINI_API_KEY not found. Please set it in the .env file.")
     exit()
-
-genai.configure(api_key=GEMINI_API_KEY)
-SAVE_PATH = os.getenv("MARKDOWN_SAVE_PATH") # Use the corrected env var name
 if not SAVE_PATH:
     print("Error: MARKDOWN_SAVE_PATH not found in .env file or environment.")
+    print("Please ensure it is defined correctly in the .env file.")
     exit()
 
+# --- Remote LLM Configuration ---
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+except Exception as e:
+    print(f"Error configuring Remote LLM API: {e}")
+    exit()
+
+# Limit text sent to Remote LLM (adjust as needed)
 MAX_TEXT_LENGTH_FOR_GEMINI = 15000
 
-# --- Helper Functions (sanitize_filename - same, create_markdown_content - uses formatted desc) ---
+# --- Helper Functions ---
 
 def sanitize_filename(name):
     """Removes characters that are invalid for Windows filenames."""
@@ -35,12 +43,12 @@ def sanitize_filename(name):
         return "Unnamed Job Posting"
     name = re.sub(r'[<>:"/\\|?*]', '', name)
     name = re.sub(r'\s+', ' ', name).strip()
-    name = name[:150]
+    name = name[:150] # Limit filename length
     return name if name else "Unnamed Job Posting"
 
 def create_markdown_content(data):
     """Formats the job data into Markdown using the potentially formatted description."""
-    description_content = data.get('description', '') # This will now be Markdown
+    description_content = data.get('description', '') # Expects formatted description here
 
     content = f"""---
 company: {data.get('company', '')}
@@ -63,26 +71,33 @@ link: {data.get('link', '')}
 
 {description_content}
 """
+    # Ensure consistent line endings
     return content.replace('\r\n', '\n')
 
+# --- Selenium Function ---
 
-# --- Selenium Function (get_page_html_selenium - same) ---
 def get_page_html_selenium(url):
-    # ... (Keep the existing Selenium function exactly the same) ...
+    """Fetches the full page HTML using Selenium after waiting for JS."""
     print("Initializing Selenium WebDriver...")
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    # options.add_argument("--headless")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer") 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--log-level=3") # Reduce console noise from Selenium/WebDriver
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 
     driver = None
     try:
         service = ChromeService(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+        driver.set_page_load_timeout(30) # Set timeout for page load
         print(f"Navigating to {url}...")
         driver.get(url)
+        # Simple wait - consider WebDriverWait for more robust waiting if needed
+        print("Waiting briefly for dynamic content...")
         time.sleep(5)
         print("Retrieving page source...")
         html_content = driver.page_source
@@ -99,68 +114,71 @@ def get_page_html_selenium(url):
             print("Closing Selenium WebDriver.")
             driver.quit()
 
+# --- Text Extraction Function ---
 
-# --- Text/HTML Extraction Function (Modified) ---
-def extract_content_parts(html_content):
+def extract_plain_description_text(html_content):
     """
-    Extracts both the relevant BeautifulSoup element for formatting
-    and the plain text for Gemini context.
-    Returns: (BeautifulSoup Element | None, str | None)
+    Attempts to find the main job description block and returns its plain text.
+    Falls back to body text if specific selectors fail.
     """
     if not html_content:
-        return None, None
+        return None
 
     print("Parsing HTML with BeautifulSoup...")
     soup = BeautifulSoup(html_content, 'html.parser')
     main_content_element = None
-    main_content_text = None
+    plain_text = None
 
-    # Try to find common main content containers - This is heuristic!
-    selectors = ['main', 'article', '[role="main"]', '#content', '#job-details',
-                 '#jobDescriptionText', '.job-description', '.job-details', '.content']
+    # List of selectors to try (prioritize more specific ones)
+    selectors = [
+        '#jobDescriptionText', '.job-description', '.job-details', '#job-details',
+        'article', '[role="main"]', 'main', '#content', '.content'
+    ]
+    print(f"Trying selectors: {selectors}")
     for selector in selectors:
         try:
             main_content_element = soup.select_one(selector)
             if main_content_element:
-                print(f"Found main content element using selector: '{selector}'")
-                break
+                print(f"Found potential content element using selector: '{selector}'")
+                break # Stop after first match
         except Exception as e:
             print(f"Error trying selector '{selector}': {e}")
 
+    # Extract text from the found element OR fallback to body
+    target_element = main_content_element if main_content_element else soup.body
     if not main_content_element:
-        print("Could not find specific main content tag, falling back to body.")
-        main_content_element = soup.body
+         print("Could not find specific main content element, using text from <body>.")
 
-    if main_content_element:
+    if target_element:
         print("Extracting plain text from selected content...")
-        # Get the plain text version for Gemini context
-        main_content_text = main_content_element.get_text(separator='\n', strip=True)
-        main_content_text = re.sub(r'\n\s*\n', '\n\n', main_content_text)
-        print(f"Extracted text length for Gemini: {len(main_content_text)} characters.")
+        # Remove script and style elements before getting text
+        for element in target_element(["script", "style"]):
+            element.decompose()
+        plain_text = target_element.get_text(separator='\n', strip=True)
+        plain_text = re.sub(r'\n\s*\n', '\n\n', plain_text) # Clean up whitespace
+        print(f"Extracted plain text length: {len(plain_text)} characters.")
     else:
-        print("Warning: Could not extract content element.")
-        main_content_element = None # Ensure it's None if body wasn't found either
+        print("Warning: Could not extract any text content.")
+        plain_text = None
 
-    # Return the BeautifulSoup element itself and the plain text
-    return main_content_element, main_content_text
+    return plain_text
 
-# --- Gemini Function (Modified Prompt) ---
+# --- Remote LLM Function (Call 1: Extract Fields + Plain Description) ---
 
 def extract_job_data_with_gemini(text_content, job_url):
     """
-    Sends text content to Gemini API and asks for structured job data,
-    *excluding* the description (as we'll format that separately).
+    Sends text content to Remote LLM API and asks for structured job data,
+    INCLUDING the plain text description.
     """
     if not text_content:
-        print("No text content provided to Gemini.")
+        print("No text content provided to Remote LLM for extraction.")
         return None
 
-    print("Preparing prompt for Gemini (excluding description field)...")
+    print("Preparing prompt for Remote LLM (extraction call)...")
     limited_text = text_content[:MAX_TEXT_LENGTH_FOR_GEMINI]
     if len(text_content) > MAX_TEXT_LENGTH_FOR_GEMINI:
-        print(f"Warning: Text content truncated to {MAX_TEXT_LENGTH_FOR_GEMINI} characters for Gemini.")
+        print(f"Warning: Text content truncated to {MAX_TEXT_LENGTH_FOR_GEMINI} characters for Remote LLM.")
 
-    # Modified prompt: Ask for description as "" or omit it
     prompt = f"""
     Analyze the following job posting text obtained from the URL "{job_url}".
     Extract the specific information requested below.
@@ -170,8 +188,9 @@ def extract_job_data_with_gemini(text_content, job_url):
     - "location": The primary location(s) mentioned (e.g., "Chicago, IL", "Remote", "London, UK").
     - "comp": The salary or compensation range if explicitly mentioned (e.g., "$100,000 - $120,000", "£50k"). Otherwise, "".
     - "req": The requisition ID or job ID if explicitly mentioned. Otherwise, "".
+    - "description": The main body of the job description, duties, and qualifications as plain text. Preserve paragraph breaks with newline characters (\\n).
 
-    If any piece of information is not found or cannot be determined, use an empty string "" for its value. Do not include a "description" key in the JSON.
+    If any piece of information is not found or cannot be determined, use an empty string "" for its value. Ensure the entire output is a single, valid JSON object starting with {{ and ending with }}.
 
     Job Posting Text:
     ---
@@ -181,96 +200,132 @@ def extract_job_data_with_gemini(text_content, job_url):
     JSON Output:
     """
 
-    print("Sending request to Gemini API...")
+    print("Sending request to Remote LLM API for data extraction...")
     try:
-        # Ensure JSON mode is requested if available and desired for reliability
+        # Request JSON output format
         generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
         model = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
-        # Or use 'gemini-pro' if flash is not sufficient
-        # model = genai.GenerativeModel('gemini-pro', generation_config=generation_config)
+        # model = genai.GenerativeModel('gemini-pro', generation_config=generation_config) # Alternative
 
         response = model.generate_content(prompt)
 
-        # Debug: Print raw response
-        # print(f"Gemini Raw Response Text:\n---\n{response.text}\n---")
+        # Debugging raw response:
+        # print(f"Remote LLM Raw Extraction Response:\n---\n{response.text}\n---")
 
-        # The response should directly be parseable JSON if response_mime_type worked
+        # Response should be directly parseable JSON
         extracted_data = json.loads(response.text)
-        print("Successfully parsed JSON response from Gemini.")
+        print("Successfully parsed JSON response from Remote LLM (extraction call).")
         return extracted_data
 
     except json.JSONDecodeError as e:
-        print(f"Error: Failed to decode JSON response from Gemini: {e}")
-        print(f"Gemini Raw Response causing error:\n---\n{response.text}\n---")
+        print(f"Error: Failed to decode JSON response from Remote LLM (extraction call): {e}")
+        print(f"Remote LLM Raw Response causing error:\n---\n{response.text}\n---")
         return None
     except Exception as e:
-        print(f"Error interacting with Gemini API: {e}")
-        # print(f"Full Gemini Response Object: {response}")
+        print(f"Error interacting with Remote LLM API (extraction call): {e}")
+        # You might want to inspect the response object for more details if it exists
+        # if 'response' in locals(): print(f"Full Response Object: {response}")
         return None
 
-# --- Main Execution (Modified) ---
+# --- Remote LLM Function (Call 2: Format Description) ---
 
-# --- Main Execution (Modified) ---
+def format_description_with_gemini(plain_description_text):
+    """Sends plain text description to Remote LLM API for Markdown formatting."""
+    if not plain_description_text:
+        print("No description text provided for formatting.")
+        return ""
+
+    print("Preparing formatting prompt for Remote LLM...")
+    # Limit length again, just in case
+    limited_text = plain_description_text[:MAX_TEXT_LENGTH_FOR_GEMINI]
+    if len(plain_description_text) > MAX_TEXT_LENGTH_FOR_GEMINI:
+         print(f"Warning: Description text truncated to {MAX_TEXT_LENGTH_FOR_GEMINI} characters for formatting.")
+
+    prompt = f"""
+Please reformat the following job description using Markdown elements to improve its structure and readability. Use appropriate Markdown for headings (like ## or ### for sections like Responsibilities, Qualifications, About Us, etc.), bold text for emphasis (like **Required Skills:** or **Benefits**), and bullet points (* item or - item) for lists where applicable. Ensure paragraphs are separated by double newlines. Output ONLY the formatted Markdown text. Do not add any introductory sentences, closing remarks, or explanations.
+
+Original Plain Text Description:
+---
+{limited_text}
+---
+
+Formatted Markdown Description:
+"""
+
+    print("Sending request to Remote LLM API for formatting...")
+    try:
+        # For formatting, standard text generation is fine
+        model = genai.GenerativeModel('gemini-1.5-flash') # Or 'gemini-pro'
+        # Increase temperature slightly for potentially better formatting flow
+        generation_config = genai.types.GenerationConfig(temperature=0.3)
+
+        response = model.generate_content(prompt, generation_config=generation_config)
+        formatted_text = response.text.strip()
+        print("Successfully received formatted description from Remote LLM.")
+
+        # Basic check if formatting likely failed / returned empty or garbage
+        if not formatted_text or len(formatted_text) < len(plain_description_text) * 0.5:
+             print("Warning: Formatting result seems short or empty. Falling back to plain text.")
+             return plain_description_text # Fallback
+
+        return formatted_text
+    except Exception as e:
+        print(f"Error interacting with Remote LLM API for formatting: {e}")
+        print("Falling back to original plain text description.")
+        return plain_description_text # Fallback
+
+# --- Main Execution ---
 
 def main():
-    print("--- Job Application Markdown Creator (Selenium + Gemini w/ Formatting, No Images) ---")
-    job_url = input("1. Paste the Job Application URL: ")
+    print("--- Job Application Markdown Creator ---")
+    job_url = input("- Paste the Job Application URL: ")
 
     # 1. Fetch HTML using Selenium
     html_content = get_page_html_selenium(job_url)
 
     extracted_data = None
-    formatted_description = "" # Initialize formatted description
+    plain_description = ""     # Store plain description from first call
+    final_description = ""     # Store final description (formatted or plain)
 
     if html_content:
-        # 2. Extract relevant BeautifulSoup element and plain text
-        # Now gets the BS4 element directly
-        main_content_element, main_text_content = extract_content_parts(html_content)
+        # 2. Extract plain text content (best effort)
+        plain_text_context = extract_plain_description_text(html_content)
 
-        if main_text_content:
-            # 3. Extract structured data (excluding desc) using Gemini
-            extracted_data = extract_job_data_with_gemini(main_text_content, job_url)
+        if plain_text_context:
+            # 3. Extract structured data AND plain description via Remote LLM (Call 1)
+            extracted_data = extract_job_data_with_gemini(plain_text_context, job_url)
 
-        # 4. Remove images and Convert HTML element to Markdown LOCALLY
-        if main_content_element:
-            print("Removing images from HTML fragment...")
-            try:
-                # Find all 'img' tags within the extracted element and remove them
-                for img_tag in main_content_element.find_all('img'):
-                    img_tag.decompose() # Removes the tag and its content
-
-                print("Converting image-free HTML fragment to Markdown...")
-                # Convert the *modified* element back to string for markdownify
-                html_no_images = str(main_content_element)
-                formatted_description = markdownify(html_no_images, heading_style="ATX")
-                print("HTML successfully converted to Markdown (no images).")
-
-            except Exception as e:
-                print(f"Error during image removal or Markdown conversion: {e}")
-                print("Falling back to plain text description if available.")
-                formatted_description = main_text_content # Fallback to plain text
-        elif main_text_content:
-             print("Warning: No HTML element found for formatting, using plain text.")
-             formatted_description = main_text_content
+            if extracted_data:
+                # Get the plain description extracted by Remote LLM in the first call
+                plain_description = extracted_data.get('description', '').strip()
+                if plain_description:
+                     # 4. Format the plain description via Remote LLM (Call 2)
+                     final_description = format_description_with_gemini(plain_description)
+                else:
+                     print("Warning: Remote LLM did not return a description in the first call. Using empty description.")
+                     final_description = "" # Ensure it's empty if no plain desc found
+            else:
+                 print("First Remote LLM call failed to extract base data. No description available.")
+                 final_description = "Error: Failed to extract job data."
         else:
-            print("Skipping formatting as no relevant content could be extracted.")
-
+            print("Could not extract text context for Remote LLM. Cannot proceed.")
+            final_description = "Error: Could not extract page text."
     else:
         print("Skipping further steps as page HTML could not be fetched.")
+        final_description = "Error: Could not fetch page HTML."
 
-
-    # 5. Process and Save Markdown File (This part remains the same)
+    # 5. Process and Save Markdown File (Only if base data extraction was successful)
     if extracted_data:
-        print("Gemini extraction successful. Preparing Markdown file...")
+        print("Base data extraction successful. Preparing Markdown file...")
 
-        # Prepare final data dictionary using the formatted description
+        # Prepare final data dictionary
         final_data = {
             'company': extracted_data.get('company', '').strip(),
             'role': extracted_data.get('role', '').strip(),
             'location': extracted_data.get('location', '').strip(),
             'comp': extracted_data.get('comp', '').strip(),
             'req': extracted_data.get('req', '').strip(),
-            'description': formatted_description.strip(), # Use the formatted/converted MD (now without images)
+            'description': final_description.strip(), # Use formatted (or plain fallback) description
             'link': job_url,
             'date_applied': datetime.date.today().strftime('%Y-%m-%d'),
             'applied': True, # Defaults
@@ -280,10 +335,9 @@ def main():
             'declined': False,
         }
 
-        # Create filename
+        # --- Filename Generation, Directory Creation, Saving ---
         company_name = final_data.get('company')
         role_name = final_data.get('role')
-        # ... (filename generation logic - same as before) ...
         if not company_name and not role_name:
              base_filename = f"Job Posting {final_data['date_applied']}.md"
              print("Warning: Could not determine Company or Role. Using generic filename.")
@@ -297,37 +351,34 @@ def main():
         safe_filename = sanitize_filename(base_filename)
         full_path = os.path.join(SAVE_PATH, safe_filename)
 
-        # Create directory if needed
         try:
+            # Ensure target directory exists
             os.makedirs(SAVE_PATH, exist_ok=True)
-        except OSError as e:
-            print(f"\nError creating directory {SAVE_PATH}: {e}")
-            return
+            print(f"Ensured directory exists: {SAVE_PATH}")
 
-        # Generate Markdown content
-        markdown_content = create_markdown_content(final_data)
+            # Generate Markdown content
+            markdown_content = create_markdown_content(final_data)
+            print("Markdown content generated.")
 
-        # Save the file
-        try:
+            # Save the file
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(markdown_content)
             print("-" * 30)
             print(f"Successfully created Markdown file:")
             print(f"{full_path}")
             print("-" * 30)
+        except OSError as e:
+            print(f"\nError creating directory or writing file {full_path}: {e}")
         except IOError as e:
             print(f"\nError writing file {full_path}: {e}")
         except Exception as e:
-            print(f"\nAn unexpected error occurred during file writing: {e}")
+            print(f"\nAn unexpected error occurred during file processing: {e}")
 
     else:
-        print("\nCould not extract base job data automatically using Gemini.")
-        if formatted_description:
-             print("However, a description fragment was processed (without images). Consider manual entry for other fields.")
-
-
-if __name__ == "__main__":
-    main()
+        print("\nCould not extract base job data automatically using Remote LLM. No file created.")
+        # Print the description error if one occurred
+        if final_description.startswith("Error:"):
+            print(final_description)
 
 
 if __name__ == "__main__":
